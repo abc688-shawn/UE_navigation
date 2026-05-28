@@ -40,8 +40,7 @@ from astar_planner_v2 import (
     load_config,
     ConfigurationSpace, CoordinateTransformer,
     HybridAStarPlanner, HybridAStarConfig,
-    GradientDescentSmoother, ha_path_to_pixels,
-    resample_path, compute_yaw, smooth_path_rdp,
+    postprocess_hybrid_path, compute_yaw,
 )
 
 # ── 文件路径 ──────────────────────────────────────────────────────
@@ -615,32 +614,6 @@ def build_hybrid_astar_config(grid_config: dict, nav_cfg: dict) -> HybridAStarCo
     return HybridAStarConfig.from_config(merged_cfg)
 
 
-def postprocess_hybrid_path(raw_path,
-                            cspace: ConfigurationSpace,
-                            transformer: CoordinateTransformer,
-                            ha_cfg: HybridAStarConfig,
-                            z_fixed: float,
-                            interval_cm: float):
-    """
-    Hybrid A* 在线路径后处理：
-    节点路径 → RDP 简化 → 梯度下降平滑 → 重采样。
-    """
-    path_pixels = ha_path_to_pixels(raw_path, transformer)
-    path_simplified = smooth_path_rdp(path_pixels, epsilon=2.0)
-
-    path_m = []
-    for u, v in path_simplified:
-        x_cm, y_cm, _ = transformer.pixel_to_world(u, v)
-        path_m.append((x_cm / 100.0, y_cm / 100.0))
-
-    if len(path_m) >= 3 and ha_cfg.smooth_iterations > 0:
-        smoother = GradientDescentSmoother(path_m, cspace, transformer, ha_cfg)
-        path_m = smoother.smooth()
-
-    world_cm = [(x * 100.0, y * 100.0, z_fixed) for x, y in path_m]
-    return resample_path(world_cm, interval_cm=interval_cm)
-
-
 # ══════════════════════════════════════════════════════════════════
 # Hybrid A* 重规划
 # ══════════════════════════════════════════════════════════════════
@@ -733,7 +706,8 @@ def draw_debug(static_vis: np.ndarray,   # float32，0=障碍，1=自由
                auv_x: float, auv_y: float, nav_yaw_deg: float,
                goal_x: float, goal_y: float,
                transformer: CoordinateTransformer,
-               state: str, replan_count: int,
+               state: str, replan_total: int,
+               replan_streak: int,
                local_reason: str = 'track') -> np.ndarray:
     base = (static_vis * 200).astype(np.uint8)
     vis  = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
@@ -762,7 +736,7 @@ def draw_debug(static_vis: np.ndarray,   # float32，0=障碍，1=自由
     # HUD
     dist = math.hypot(auv_x - goal_x, auv_y - goal_y)
     hud  = [
-        f'State: {state}   Replans: {replan_count}',
+        f'State: {state}   Replans: {replan_total}  Streak: {replan_streak}',
         f'AUV ({auv_x:.0f}, {auv_y:.0f})  yaw={nav_yaw_deg:.1f}',
         f'dist_goal={dist:.0f}cm  WP {cursor}/{len(waypoints) if waypoints else 0}',
         f'Local: {local_reason}',
@@ -861,13 +835,16 @@ def main():
     state        = IDLE
     waypoints    = []     # List[(x_cm, y_cm, z_cm)]
     cursor       = 0
-    replan_count = 0
+    replan_total = 0
+    replan_streak = 0
+    invalid_plan_streak = 0
     last_replan  = 0.0
     last_pose_ok = None   # 首次收到 pose 的时间
     # 进度监控
     min_dist_seen      = float('inf')
     last_progress_time = None
     stall_timeout_s    = cfg_plan.get('stall_timeout_s', 15.0)
+    replan_confirm_frames = max(1, int(cfg_plan.get('replan_confirm_frames', 3)))
     last_depth_scan    = None
     last_depth_time    = 0.0
     last_local_reason  = 'track'
@@ -901,6 +878,8 @@ def main():
                     continue
                 waypoints   = wp
                 cursor      = 0
+                replan_streak = 0
+                invalid_plan_streak = 0
                 last_pose_ok = time.time()
                 print(f'[NAV] 初始路径 {len(waypoints)} 个 waypoint → NAV')
                 state = NAV
@@ -957,6 +936,7 @@ def main():
             if dist_goal < min_dist_seen - 50.0:
                 min_dist_seen = dist_goal
                 last_progress_time = now
+                replan_streak = 0
             elif (now - last_progress_time) > stall_timeout_s:
                 print(f'[NAV] 连续 {stall_timeout_s:.0f}s 无进展 (dist={dist_goal:.0f}cm) → 寻找逃脱路径')
                 escape = find_escape_target(
@@ -972,6 +952,8 @@ def main():
                 min_dist_seen = dist_goal
                 last_progress_time = now
                 last_replan = 0.0
+                replan_streak = 0
+                invalid_plan_streak = 0
 
             # waypoint 推进
             while cursor < len(waypoints):
@@ -983,15 +965,26 @@ def main():
             cursor = min(cursor, len(waypoints) - 1) if waypoints else 0
 
             # 路径有效性 + 重规划
-            need_replan = not validate_plan(
+            plan_valid = validate_plan(
                 waypoints, cursor, combined_safe,
                 cfg_plan['lookahead_waypoints'], transformer,
                 auv_pix=(auv_u, auv_v))
+            if plan_valid:
+                invalid_plan_streak = 0
+            else:
+                invalid_plan_streak += 1
+
+            need_replan = invalid_plan_streak >= replan_confirm_frames
             if need_replan and (now - last_replan) > cfg_plan['replan_cooldown_s']:
-                replan_count += 1
-                print(f'[NAV] REPLAN #{replan_count}  dist={dist_goal:.0f}cm')
-                if replan_count > cfg_plan['max_replans']:
-                    print('[NAV] 重规划次数超限 → FAILED')
+                replan_total += 1
+                replan_streak += 1
+                print(
+                    f'[NAV] REPLAN #{replan_total} '
+                    f'(streak={replan_streak}, invalid={invalid_plan_streak})  '
+                    f'dist={dist_goal:.0f}cm'
+                )
+                if replan_streak > cfg_plan['max_replans']:
+                    print('[NAV] 连续无进展重规划次数超限 → FAILED')
                     state = FAILED
                     break
                 # 清除 AUV 周围 log-odds（至少 5 格，突破局部假障碍陷阱）
@@ -1016,6 +1009,7 @@ def main():
                 waypoints   = new_wp
                 cursor      = 0
                 last_replan = now
+                invalid_plan_streak = 0
 
             # 发送指令：全局 waypoint 前再过一层近场局部避障，避免直线顶到未知障碍
             if cursor < len(waypoints):
@@ -1042,7 +1036,7 @@ def main():
                 waypoints, cursor,
                 auv_x, auv_y, auv_yaw,
                 goal_x, goal_y,
-                transformer, state, replan_count,
+                transformer, state, replan_total, replan_streak,
                 last_local_reason)
             cv2.imshow('Navigate', vis)
             if _vwriter is not None:
@@ -1056,7 +1050,7 @@ def main():
                 time.sleep(dt - elapsed)
 
     finally:
-        print(f'[NAV] 结束  state={state}  replans={replan_count}')
+        print(f'[NAV] 结束  state={state}  replans={replan_total}  streak={replan_streak}')
         if _vwriter is not None:
             _vwriter.release()
             print(f'[NAV] 录像已保存 → {_video_path}')
