@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-depth_test_route.py
+stereo_accuracy_test.py
 沿预设直线路线 (-1000,0,200) → (500,0,200) 匀速行驶，
 逐帧记录「真实剩余距离（到墙 x=500）」vs「SGBM 中央区域测得深度」，
 用于诊断双目感知在不同距离下的精度与有效率。
 
 用法：
-    python scripts/depth_test_route.py
+    python scripts/stereo_accuracy_test.py
 
 输出：
   - cv2 窗口：左目（叠加测量信息）+ 深度伪彩图
-  - result/depth_test_log.csv：每帧日志（可用 Excel/pandas 分析）
+  - result/depth_test_log.csv：每帧日志（可用 plot_stereo_accuracy.py 分析）
 """
 
 import csv
@@ -26,6 +26,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+# ── 相机参数：统一从 stereo_depth 导入，由 navigation_config.json 驱动 ────────
+from stereo_depth import (
+    IMAGE_W as IMG_W, IMAGE_H as IMG_H,
+    FOV_H_DEG as FOV_DEG, BASELINE_M, FOCAL_PX,
+)
+
 # ── 路线参数 ──────────────────────────────────────────────────────────────────
 START    = (-1000.0, 0.0, 200.0)   # 起点 (x, y, z) cm
 GOAL     = (  500.0, 0.0, 200.0)   # 终点 cm（墙所在位置）
@@ -35,13 +41,6 @@ STEP_CM  =   50.0                  # waypoint 间距 cm
 REACH_CM =   40.0                  # 判定到达 waypoint 的门限 cm（缩小使终点更精确）
 CTRL_HZ  =   10                    # 控制频率
 WP_TIMEOUT_S = 20.0                # 单个 waypoint 超时（跳过）
-
-# ── 相机参数（与 UE 及 depthV2.py 一致）──────────────────────────────────────
-IMG_W      = 1920
-IMG_H      = 1080
-FOV_DEG    = 90.0
-BASELINE_M = 0.03
-FOCAL_PX   = (IMG_W / 2.0) / math.tan(math.radians(FOV_DEG) / 2.0)   # ≈ 960 px
 
 # ── SGBM 参数（与 depthV2.py 默认一致）──────────────────────────────────────
 NUM_DISP   = 128
@@ -199,11 +198,7 @@ def compute_depth(left_bgr: np.ndarray, right_bgr: np.ndarray,
                   sgbm: cv2.StereoSGBM) -> np.ndarray:
     lg = _clahe_obj.apply(cv2.cvtColor(left_bgr,  cv2.COLOR_BGR2GRAY))
     rg = _clahe_obj.apply(cv2.cvtColor(right_bgr, cv2.COLOR_BGR2GRAY))
-    # 垂直基线：旋转使极线变为水平，满足 SGBM 约定
-    lr = cv2.rotate(lg, cv2.ROTATE_90_CLOCKWISE)
-    rr = cv2.rotate(rg, cv2.ROTATE_90_CLOCKWISE)
-    dr = sgbm.compute(lr, rr)
-    d  = cv2.rotate(dr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    d = sgbm.compute(lg, rg)
     # CV_16S 视差 → 深度（米）
     valid = d > 0
     depth = np.zeros(d.shape, np.float32)
@@ -248,8 +243,8 @@ def main():
     waypoints = [(START[0] + i / n * total, START[1], START[2])
                  for i in range(n + 1)]
     print(f"[test] 路线: {START} → {GOAL}  共 {len(waypoints)} 个 waypoint")
-    print(f"[test] 提示：双目基线={BASELINE_M}m，可靠测距范围约 1.5~2m，"
-          f"鱼到墙 <{int(FOCAL_PX*BASELINE_M*100)} cm 时深度才稳定")
+    print(f"[test] 提示：双目基线={BASELINE_M}m，焦距≈{FOCAL_PX:.0f}px，"
+          f"f·B={FOCAL_PX*BASELINE_M:.1f} px·m，静态场景验证可靠测距到 15m")
 
     # 连接控制端口
     ctrl = socket.socket()
@@ -338,8 +333,8 @@ def main():
 
             # 真实距离（cm → m）
             true_dist = max(0.0, (WALL_X - cx) / 100.0)
-            # 双目可靠范围：f*B = 960*0.03 ≈ 28.8 px·m；可靠深度 < ~2m
-            in_range  = true_dist < 2.0
+            # 双目可靠范围：f*B = 960*0.10 = 96 px·m；静态测试验证可靠深度到 15m
+            in_range  = true_dist < 15.0
 
             # 误差
             if meas > 0:
@@ -402,7 +397,7 @@ def main():
                          else (150, 150, 150))
             depth_line = (f"SGBM 测量深度: {meas:.3f} m" if meas > 0
                           else "SGBM 测量深度: 无有效视差")
-            range_line = "◀ 已进入测距范围 ▶" if in_range else "超出可靠范围（需距墙 <200 cm）"
+            range_line = "◀ 已进入测距范围（<15m）▶" if in_range else "超出可靠范围（>15m）"
             range_clr  = (0, 220, 80) if in_range else (80, 80, 255)
 
             text_entries = [

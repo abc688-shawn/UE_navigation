@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-plot_depth_test.py
-读取 result/depth_test_log.csv，绘制双目测距精度分析图。
+plot_stereo_accuracy.py
+读取 result/depth_test_log.csv（由 stereo_accuracy_test.py 生成），
+绘制双目测距精度分析图。
 输出：result/depth_test_analysis.png（同时弹出交互窗口）
 
 用法：
-    python scripts/plot_depth_test.py
+    python scripts/plot_stereo_accuracy.py
 """
 
 import csv

@@ -12,7 +12,13 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
+try:
+    from scipy.interpolate import splprep, splev
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
 
 
 Pixel = Tuple[int, int]
@@ -38,10 +44,13 @@ def load_config(config_path: str) -> dict:
 
 
 class ConfigurationSpace:
-    def __init__(self, grid: List[List[bool]], config: dict):
-        self.original_grid = grid
-        self.height = len(grid)
-        self.width = len(grid[0]) if self.height > 0 else 0
+    def __init__(self, grid, config: dict):
+        # Accept either List[List[bool]] or np.ndarray (H×W bool)
+        if isinstance(grid, np.ndarray):
+            self.original_grid = grid.astype(bool)
+        else:
+            self.original_grid = np.array(grid, dtype=bool)
+        self.height, self.width = self.original_grid.shape
 
         self.cm_per_pixel = config["resolution"]["cm_per_pixel"]
         planning = config.get("planning", {})
@@ -70,89 +79,47 @@ class ConfigurationSpace:
                     offsets.append((dv, du))
         return offsets
 
-    def inflate_obstacles(self) -> List[List[bool]]:
+    def inflate_obstacles(self) -> np.ndarray:
         print(
             f"  膨胀半径: {self.inflation_pixels} 像素 "
             f"({self.inflation_pixels * self.cm_per_pixel / 100:.2f} m)"
         )
 
-        self.inflated_grid = [[True for _ in range(self.width)] for _ in range(self.height)]
-        offsets = self._disk_offsets(self.inflation_pixels)
-        for v in range(self.height):
-            for u in range(self.width):
-                if self.original_grid[v][u]:
-                    continue
-                for dv, du in offsets:
-                    nv, nu = v + dv, u + du
-                    if 0 <= nv < self.height and 0 <= nu < self.width:
-                        self.inflated_grid[nv][nu] = False
+        # obstacle pixels = 1 (dilate expands bright regions)
+        obs = (~self.original_grid).astype(np.uint8)
+        k = 2 * self.inflation_pixels + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(obs, kernel)
+        self.inflated_grid = (dilated == 0)   # numpy bool H×W: True=free
 
-        original_obstacles = sum(
-            1
-            for v in range(self.height)
-            for u in range(self.width)
-            if not self.original_grid[v][u]
-        )
-        inflated_obstacles = sum(
-            1
-            for v in range(self.height)
-            for u in range(self.width)
-            if not self.inflated_grid[v][u]
-        )
-
-        print(f"  原始障碍格子: {original_obstacles}")
-        print(f"  膨胀后障碍格子: {inflated_obstacles}")
+        print(f"  原始障碍格子: {int(obs.sum())}")
+        print(f"  膨胀后障碍格子: {int((~self.inflated_grid).sum())}")
         return self.inflated_grid
 
-    def compute_distance_field(self) -> List[List[float]]:
+    def compute_distance_field(self) -> np.ndarray:
         print(
             f"  危险区域半径: {self.danger_pixels} 像素 "
             f"({self.danger_pixels * self.cm_per_pixel / 100:.2f} m)"
         )
 
-        inf = float("inf")
-        self.distance_field = [[inf for _ in range(self.width)] for _ in range(self.height)]
-
-        pq: List[Tuple[float, int, int]] = []
-        for v in range(self.height):
-            for u in range(self.width):
-                if not self.original_grid[v][u]:
-                    self.distance_field[v][u] = 0.0
-                    heapq.heappush(pq, (0.0, v, u))
-
-        directions = [
-            (-1, 0, 1.0),
-            (1, 0, 1.0),
-            (0, -1, 1.0),
-            (0, 1, 1.0),
-            (-1, -1, math.sqrt(2.0)),
-            (-1, 1, math.sqrt(2.0)),
-            (1, -1, math.sqrt(2.0)),
-            (1, 1, math.sqrt(2.0)),
-        ]
-
-        while pq:
-            dist, v, u = heapq.heappop(pq)
-            if dist > self.distance_field[v][u]:
-                continue
-            if dist > self.danger_pixels:
-                continue
-            for dv, du, cost in directions:
-                nv, nu = v + dv, u + du
-                if not (0 <= nv < self.height and 0 <= nu < self.width):
-                    continue
-                new_dist = dist + cost
-                if new_dist >= self.distance_field[nv][nu]:
-                    continue
-                self.distance_field[nv][nu] = new_dist
-                heapq.heappush(pq, (new_dist, nv, nu))
+        # src: 1=free (background), 0=obstacle (feature)
+        # cv2.distanceTransform returns distance from each pixel to nearest 0-pixel
+        src = self.original_grid.astype(np.uint8)
+        if src.min() == 1:
+            # No obstacles: every cell is maximally far; use sentinel large value
+            self.distance_field = np.full(
+                (self.height, self.width),
+                float(self.danger_pixels + 1),
+                dtype=np.float32)
+        else:
+            self.distance_field = cv2.distanceTransform(src, cv2.DIST_L2, 5)
 
         return self.distance_field
 
     def get_danger_penalty(self, v: int, u: int) -> float:
         if self.distance_field is None:
             return 0.0
-        dist = self.distance_field[v][u]
+        dist = float(self.distance_field[v, u])
         if dist >= self.danger_pixels:
             return 0.0
         return 1.0 - dist / self.danger_pixels
@@ -440,7 +407,7 @@ class HybridAStarPlanner:
 
     def _is_valid_pixel(self, u: int, v: int) -> bool:
         if 0 <= v < self.cspace.height and 0 <= u < self.cspace.width:
-            return self.cspace.inflated_grid[v][u]
+            return bool(self.cspace.inflated_grid[v, u])
         return False
 
     def _dynamic_step_length(self, dist_to_goal_m: float) -> float:
@@ -518,7 +485,7 @@ class HybridAStarPlanner:
             if not (
                 0 <= sv < self.cspace.height
                 and 0 <= su < self.cspace.width
-                and self.cspace.original_grid[sv][su]
+                and bool(self.cspace.original_grid[sv, su])
             ):
                 print(f"  错误：起点 ({su}, {sv}) 不可通行")
                 return None
@@ -528,7 +495,7 @@ class HybridAStarPlanner:
             if not (
                 0 <= gv < self.cspace.height
                 and 0 <= gu < self.cspace.width
-                and self.cspace.original_grid[gv][gu]
+                and bool(self.cspace.original_grid[gv, gu])
             ):
                 print(f"  错误：终点 ({gu}, {gv}) 不可通行")
                 return None
@@ -653,15 +620,13 @@ class GradientDescentSmoother:
         u, v = self._meters_to_pixel(x_m, y_m)
         u = max(0, min(u, self.cspace.width - 1))
         v = max(0, min(v, self.cspace.height - 1))
-        d_pix = self.cspace.distance_field[v][u]
-        if d_pix == float("inf"):
-            return self.cfg.d_safe_m * 10.0
+        d_pix = float(self.cspace.distance_field[v, u])
         return d_pix * self.pixel_size_m
 
     def _is_valid_m(self, x_m: float, y_m: float) -> bool:
         u, v = self._meters_to_pixel(x_m, y_m)
         if 0 <= v < self.cspace.height and 0 <= u < self.cspace.width:
-            return self.cspace.inflated_grid[v][u]
+            return bool(self.cspace.inflated_grid[v, u])
         return False
 
     @staticmethod
@@ -835,9 +800,38 @@ def _segments_collision_free(
         for u, v in _bresenham_line(u0, v0, u1, v1):
             if not (0 <= v < cspace.height and 0 <= u < cspace.width):
                 return False
-            if not cspace.inflated_grid[v][u]:
+            if not bool(cspace.inflated_grid[v, u]):
                 return False
     return True
+
+
+def _bspline_smooth(path_m: List[WorldPointM],
+                    cspace: ConfigurationSpace,
+                    transformer: CoordinateTransformer,
+                    n_eval: int = 400) -> List[WorldPointM]:
+    """
+    用三次 B 样条把梯度平滑后的折线插值成 C2 连续曲线。
+    若 scipy 不可用、点数不足或样条穿过障碍，则原样返回。
+    n_eval 控制评估点密度（后续 resample_path 再按实际间距稀化）。
+    """
+    if not _HAS_SCIPY or len(path_m) < 4:
+        return path_m
+
+    xs = [p[0] for p in path_m]
+    ys = [p[1] for p in path_m]
+    k = min(3, len(path_m) - 1)
+    try:
+        # s=0：插值模式（精确经过所有梯度平滑后的控制点）
+        tck, _ = splprep([xs, ys], s=0, k=k)
+        u_new = np.linspace(0.0, 1.0, n_eval)
+        x_new, y_new = splev(u_new, tck)
+        spline_path = list(zip(x_new.tolist(), y_new.tolist()))
+    except Exception:
+        return path_m
+
+    if _segments_collision_free(spline_path, cspace, transformer):
+        return spline_path
+    return path_m
 
 
 def postprocess_hybrid_path(
@@ -850,7 +844,7 @@ def postprocess_hybrid_path(
 ) -> List[WorldPointCm]:
     """
     Online path postprocess pipeline:
-    raw hybrid path -> optional smoothing -> collision check -> segment subdivision.
+    raw hybrid path -> gradient smoothing -> B-spline (C2) -> resample.
     """
     path_m = [(node.x, node.y) for node in raw_path]
 
@@ -860,6 +854,9 @@ def postprocess_hybrid_path(
             path_m = smoothed
         else:
             print("    警告：平滑后路段穿过障碍，回退到未平滑路径")
+
+    # B 样条插值：把折线变成 C2 连续曲线，消除重采样引入的转角
+    path_m = _bspline_smooth(path_m, cspace, transformer)
 
     world_cm = [(x * 100.0, y * 100.0, z_fixed) for x, y in path_m]
     return resample_path(world_cm, interval_cm=interval_cm)

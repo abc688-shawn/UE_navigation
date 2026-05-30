@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-stereo_bm.py
-接收 UE 双目摄像机画面，使用 StereoSGBM + WLS 滤波计算深度图，支持鼠标测距。
+stereo_depth.py
+双目深度感知模块：接收 UE 双目帧流，使用 StereoSGBM + WLS 滤波计算深度图。
+
+库接口（供 navigate.py / occupancy_mapper.py 导入）：
+  recv_stereo_frame, decode_jpeg, apply_clahe,
+  build_stereo_sgbm, apply_wls_filter, disparity_to_depth,
+  disparity_to_float, stereo_confidence_to_float,
+  FOCAL_PX, IMAGE_W, IMAGE_H, BASELINE_M, …
+
+独立运行（调试/标定）：
+  python stereo_depth.py   —— 打开实时双目视窗，支持鼠标测距与参数调节
 
 TCP 协议（与 FrameStreamingComponent 对应）：
   UE 连接本机 LISTEN_PORT（8989），每帧发送：
@@ -130,18 +139,26 @@ def _send_setpose(sock: socket.socket, x: float, y: float,
     cmd = f'SetPose:{x:.1f},{y:.1f},{z:.1f},0,{yaw:.2f},0\n'
     sock.sendall(cmd.encode())
 
-# ─── 相机参数（与 UE 中设置一致） ─────────────────────────────────────────────
-IMAGE_W     = 1920          # 图像宽度（像素）
-IMAGE_H     = 1080          # 图像高度（像素）
-FOV_H_DEG   = 90.0          # 水平视场角（度）— 与 UE Camera 的 FieldOfView 一致
-BASELINE_M  = 0.03          # 双目基线距离（米）— 两个 Camera 之间的垂直间距（UE +Z）
+# ─── 相机参数（从 navigation_config.json ["camera"] 读取，硬编码值作为兜底）──
+def _load_camera_cfg() -> dict:
+    try:
+        with open(_CFG_PATH, encoding='utf-8') as f:
+            return json.load(f).get('camera', {})
+    except Exception:
+        return {}
 
-# 由 FOV 和分辨率计算像素焦距
+_cam_cfg   = _load_camera_cfg()
+IMAGE_W    = int(_cam_cfg.get('image_w',    1920))
+IMAGE_H    = int(_cam_cfg.get('image_h',    1080))
+FOV_H_DEG  = float(_cam_cfg.get('fov_h_deg', 90.0))
+BASELINE_M = float(_cam_cfg.get('baseline_m', 0.10))
+
+# 由 FOV 和分辨率计算像素焦距（所有下游模块 import 此值，无需各自重复计算）
 _fov_h_rad = math.radians(FOV_H_DEG)
-FOCAL_PX   = (IMAGE_W / 2.0) / math.tan(_fov_h_rad / 2.0)  # ≈ 960 px (FOV=90°)
+FOCAL_PX   = (IMAGE_W / 2.0) / math.tan(_fov_h_rad / 2.0)
 
 # ─── 默认 SGBM 参数 ───────────────────────────────────────────────────────────
-DEFAULT_NUM_DISP   = 128    # 视差范围（16 的倍数）；垂直基线下 1920 轴近距离视差较大
+DEFAULT_NUM_DISP   = 192    # 视差范围（16 的倍数）；192 对应最近可靠测距约 0.15m
 DEFAULT_BLOCK_SIZE = 5      # 匹配块大小（奇数 1~11）；SGBM 用小块即可
 DEFAULT_MIN_DISP   = 0      # 最小视差
 DEFAULT_UNIQUENESS = 15     # 唯一性比率（0~100）；收紧以过滤重复纹理弱匹配
@@ -239,7 +256,8 @@ def apply_wls_filter(sgbm, left_gray, right_gray, disp_left,
                      lmbda, sigma_color):
     """
     WLS (Weighted Least Squares) 滤波：用左右视差一致性 + 边缘引导填补空洞。
-    返回滤波后的 CV_16S 视差图。
+    返回 (filtered_disp_CV_16S, confidence_map_uint8)。
+    confidence 来自 wls.getConfidenceMap()：0=最不可信，255=最可信。
     """
     right_matcher = cv2.ximgproc.createRightMatcher(sgbm)
     disp_right = right_matcher.compute(right_gray, left_gray)
@@ -249,7 +267,16 @@ def apply_wls_filter(sgbm, left_gray, right_gray, disp_left,
     wls.setSigmaColor(sigma_color)
     filtered = wls.filter(disp_left, left_gray,
                           disparity_map_right=disp_right)
-    return filtered
+    confidence = wls.getConfidenceMap()   # CV_8UC1, 0–255
+    return filtered, confidence
+
+
+def stereo_confidence_to_float(conf_uint8: np.ndarray,
+                                valid_mask: np.ndarray) -> np.ndarray:
+    """WLS 置信图 uint8[0,255] → float32[0,1]；无效视差像素置 0。"""
+    conf = conf_uint8.astype(np.float32) / 255.0
+    conf[~valid_mask] = 0.0
+    return conf
 
 
 def disparity_to_color(disp: np.ndarray) -> np.ndarray:
@@ -529,22 +556,15 @@ def main():
                 prev_sgbm_keys = sgbm_keys.copy()
 
             # ── 计算视差（+ 可选 WLS 滤波）→ 深度 ──
-            # 垂直基线：CW 旋转使极线由竖直变为水平行，满足 SGBM 约定；
-            # 计算完成后 CCW 旋转回原始朝向供下游处理。
-            left_rot  = cv2.rotate(left_gray,  cv2.ROTATE_90_CLOCKWISE)
-            right_rot = cv2.rotate(right_gray, cv2.ROTATE_90_CLOCKWISE)
-
-            disparity_rot = stereo.compute(left_rot, right_rot)   # CV_16S，旋转帧内
+            disparity = stereo.compute(left_gray, right_gray)   # CV_16S
 
             use_wls = HAS_WLS and params["wls_sigma"] > 0
             if use_wls:
-                disparity_rot = apply_wls_filter(
-                    stereo, left_rot, right_rot, disparity_rot,
+                disparity, _ = apply_wls_filter(
+                    stereo, left_gray, right_gray, disparity,
                     lmbda=params["wls_lambda"],
                     sigma_color=params["wls_sigma"],
                 )
-
-            disparity = cv2.rotate(disparity_rot, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
             disp_color = disparity_to_color(disparity)
             depth_map  = disparity_to_depth(disparity)
